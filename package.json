@@ -7,7 +7,20 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "format": "oxfmt"
+    "format": "oxfmt",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @invenzo/server test",
+    "server:dev": "pnpm --filter @invenzo/server dev",
+    "server:build": "pnpm --filter @invenzo/server build",
+    "server:start": "pnpm --filter @invenzo/server start",
+    "server:typecheck": "pnpm --filter @invenzo/server typecheck",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:validate": "pnpm --filter @invenzo/server prisma:validate",
+    "db:generate": "pnpm --filter @invenzo/server prisma:generate",
+    "db:migrate": "pnpm --filter @invenzo/server prisma:migrate:dev",
+    "db:migrate:deploy": "pnpm --filter @invenzo/server prisma:migrate:deploy",
+    "db:status": "pnpm --filter @invenzo/server prisma:migrate:status"
   },
   "dependencies": {
     "react": "^19.0.0",
