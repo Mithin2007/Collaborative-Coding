@@ -1,0 +1,10 @@
+{
+  "description": "Unlock the potential of unused AI capacity by exchanging it for Earned Credits, while building projects and collaborating in a vibrant coding community.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
