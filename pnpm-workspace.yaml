@@ -1,0 +1,10 @@
+packages:
+  - server
+
+# pnpm 10 blocks dependency install scripts by default. These packages need
+# theirs to download/compile engines (Prisma) and native binaries (esbuild).
+onlyBuiltDependencies:
+  - "@prisma/client"
+  - "@prisma/engines"
+  - prisma
+  - esbuild

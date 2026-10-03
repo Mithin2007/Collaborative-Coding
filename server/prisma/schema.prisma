@@ -1,0 +1,685 @@
+// Invenzo AI — database schema (Milestone 1: foundation)
+//
+// Conventions
+//  * `id`        internal BigInt primary key. NEVER exposed outside the server.
+//  * `publicId`  prefixed, cryptographically random identifier (see src/lib/public-id.ts).
+//                Unique + indexed. This is the only identifier APIs may expose.
+//  * Token quantities are BigInt (integer-safe). Never floats.
+//  * EC amounts are Decimal(20,6). EC is an internal accounting unit, not money.
+//  * Two SEPARATE ledgers: the Provider Capacity Ledger (provider/model-specific
+//    tokens) and the EC Wallet Ledger (platform accounting units).
+//  * CHECK constraints and append-only triggers live in the hand-written
+//    migration `*_integrity_constraints` (Prisma cannot express them).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────── Enums ─────────────────────────
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  LOCKED
+  DELETED
+}
+
+enum Provider {
+  GEMINI
+  CLAUDE
+  OPENAI
+}
+
+enum ProviderCredentialType {
+  API_KEY
+  OAUTH
+  SERVICE_ACCOUNT
+}
+
+enum ProviderConnectionStatus {
+  PENDING
+  CONNECTED
+  VERIFIED
+  ERROR
+  EXPIRED
+  RATE_LIMITED
+  REVOKED
+  DISCONNECTED
+}
+
+enum ProviderAccountStatus {
+  ACTIVE
+  INACTIVE
+  UNAVAILABLE
+}
+
+enum ProviderModelStatus {
+  ACTIVE
+  DEPRECATED
+  DISABLED
+}
+
+enum CapacityAccountStatus {
+  ACTIVE
+  SUSPENDED
+  CLOSED
+}
+
+enum CapacityStatus {
+  AVAILABLE
+  RESERVED
+  CONSUMED
+  PENDING
+  EXPIRED
+}
+
+enum CapacitySnapshotSource {
+  USER_DECLARED
+  PROVIDER_REPORTED
+  SYSTEM_ESTIMATED
+}
+
+enum CapacityReservationStatus {
+  HELD
+  RELEASED
+  CONSUMED
+  EXPIRED
+}
+
+enum LedgerDirection {
+  CREDIT
+  DEBIT
+}
+
+enum WalletTransactionType {
+  CAPACITY_CREDIT
+  EXCHANGE_RESERVATION
+  RESERVATION_RELEASE
+  USAGE_DEBIT
+  SETTLEMENT
+  MARKETPLACE_PURCHASE
+  ADJUSTMENT
+}
+
+enum PricingVersionStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+}
+
+enum UsageType {
+  INPUT
+  CACHED_INPUT
+  OUTPUT
+}
+
+enum ExchangeOfferStatus {
+  OPEN
+  MATCHED
+  PROPOSED
+  ACCEPTED
+  CANCELLED
+  EXPIRED
+}
+
+enum ExchangeAgreementStatus {
+  PROPOSED
+  ACCEPTED
+  ACTIVE
+  SETTLED
+  CANCELLED
+  EXPIRED
+  DISPUTED
+}
+
+enum EntitlementStatus {
+  ACTIVE
+  LOW
+  EXHAUSTED
+  EXPIRED
+  REVOKED
+}
+
+enum UsageRecordStatus {
+  PENDING
+  RECORDED
+  SETTLED
+  FAILED
+  VOID
+}
+
+enum AuditEventType {
+  USER_CREATED
+  PROVIDER_CONNECTED
+  PROVIDER_VERIFIED
+  CAPACITY_CONTRIBUTED
+  CAPACITY_RESERVED
+  EC_CREDITED
+  EC_DEBITED
+  OFFER_CREATED
+  AGREEMENT_ACCEPTED
+  ENTITLEMENT_CREATED
+  STUDIO_REQUEST
+  USAGE_RECORDED
+  SETTLEMENT_COMPLETED
+  API_KEY_CREATED
+  API_KEY_REVOKED
+}
+
+enum ProjectStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum NotificationType {
+  SYSTEM
+  SECURITY
+  PROVIDER
+  CAPACITY
+  EXCHANGE
+  WALLET
+}
+
+// ───────────────────────── Identity ─────────────────────────
+
+model User {
+  id              BigInt     @id @default(autoincrement())
+  publicId        String     @unique @db.VarChar(40)
+  /// Always stored lower-case (enforced by CHECK in the integrity migration).
+  email           String     @unique
+  name            String?
+  role            UserRole   @default(USER)
+  status          UserStatus @default(PENDING_VERIFICATION)
+  emailVerifiedAt DateTime?  @db.Timestamptz(3)
+  createdAt       DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt       DateTime   @updatedAt @db.Timestamptz(3)
+
+  providerConnections ProviderConnection[]
+  capacityAccounts    CapacityAccount[]
+  wallet              Wallet?
+  offersMade          ExchangeOffer[]
+  agreementsOffered   ExchangeAgreement[]  @relation("AgreementOfferor")
+  agreementsReceived  ExchangeAgreement[]  @relation("AgreementCounterparty")
+  entitlements        Entitlement[]
+  usageRecords        UsageRecord[]
+  auditEvents         AuditEvent[]
+  projects            Project[]
+  notifications       Notification[]
+  developerApiKeys    DeveloperApiKey[]
+
+  @@index([status])
+}
+
+// ───────────────────── Provider foundation ─────────────────────
+
+/// A user's authorized link to a provider. Raw credentials are NEVER stored:
+/// `encryptedCredentialRef` is an opaque reference to vault-sealed material
+/// (vault implementation arrives in Milestone 2; null until then).
+model ProviderConnection {
+  id                     BigInt                   @id @default(autoincrement())
+  publicId               String                   @unique @db.VarChar(40)
+  userId                 BigInt
+  provider               Provider
+  credentialType         ProviderCredentialType
+  encryptedCredentialRef String?
+  status                 ProviderConnectionStatus @default(PENDING)
+  lastVerifiedAt         DateTime?                @db.Timestamptz(3)
+  revokedAt              DateTime?                @db.Timestamptz(3)
+  createdAt              DateTime                 @default(now()) @db.Timestamptz(3)
+  updatedAt              DateTime                 @updatedAt @db.Timestamptz(3)
+
+  user             User              @relation(fields: [userId], references: [id])
+  providerAccounts ProviderAccount[]
+
+  @@index([userId, provider])
+  @@index([status])
+}
+
+/// The provider-side account/project/workspace behind a connection
+/// (e.g. a Gemini project, an Anthropic workspace, an OpenAI project).
+model ProviderAccount {
+  id                BigInt                @id @default(autoincrement())
+  publicId          String                @unique @db.VarChar(40)
+  connectionId      BigInt
+  externalAccountId String
+  displayName       String?
+  status            ProviderAccountStatus @default(ACTIVE)
+  createdAt         DateTime              @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime              @updatedAt @db.Timestamptz(3)
+
+  connection       ProviderConnection @relation(fields: [connectionId], references: [id])
+  capacityAccounts CapacityAccount[]
+
+  @@unique([connectionId, externalAccountId])
+}
+
+/// Catalog of exact provider models. Identity is (provider, modelKey).
+model ProviderModel {
+  id          BigInt              @id @default(autoincrement())
+  publicId    String              @unique @db.VarChar(40)
+  provider    Provider
+  /// Exact provider model identifier, never a marketing alias.
+  modelKey    String
+  displayName String
+  status      ProviderModelStatus @default(ACTIVE)
+  createdAt   DateTime            @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime            @updatedAt @db.Timestamptz(3)
+
+  capacityAccounts CapacityAccount[]
+  pricingRates     PricingRate[]
+  offersOffered    ExchangeOffer[]   @relation("OfferOfferedModel")
+  offersRequested  ExchangeOffer[]   @relation("OfferRequestedModel")
+  entitlements     Entitlement[]
+  usageRecords     UsageRecord[]
+
+  @@unique([provider, modelKey])
+}
+
+// ═════════════════ PROVIDER CAPACITY LEDGER ═════════════════
+// Provider- and model-specific token capacity. This is NOT an EC balance and
+// there is deliberately no generic "token balance" anywhere in the schema.
+
+/// Container for capacity of ONE model under ONE provider account.
+model CapacityAccount {
+  id                BigInt                @id @default(autoincrement())
+  publicId          String                @unique @db.VarChar(40)
+  ownerId           BigInt
+  providerAccountId BigInt
+  providerModelId   BigInt
+  status            CapacityAccountStatus @default(ACTIVE)
+  createdAt         DateTime              @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime              @updatedAt @db.Timestamptz(3)
+
+  owner           User                   @relation(fields: [ownerId], references: [id])
+  providerAccount ProviderAccount        @relation(fields: [providerAccountId], references: [id])
+  providerModel   ProviderModel          @relation(fields: [providerModelId], references: [id])
+  snapshots       CapacitySnapshot[]
+  contributions   CapacityContribution[]
+
+  @@unique([providerAccountId, providerModelId])
+  @@index([ownerId])
+  @@index([providerModelId])
+}
+
+/// Append-only observation of capacity at a point in time.
+model CapacitySnapshot {
+  id                BigInt                 @id @default(autoincrement())
+  publicId          String                 @unique @db.VarChar(40)
+  capacityAccountId BigInt
+  source            CapacitySnapshotSource
+  observedAt        DateTime               @db.Timestamptz(3)
+  totalTokens       BigInt
+  usedTokens        BigInt
+  remainingTokens   BigInt
+  windowStart       DateTime?              @db.Timestamptz(3)
+  windowEnd         DateTime?              @db.Timestamptz(3)
+  metadata          Json?
+  createdAt         DateTime               @default(now()) @db.Timestamptz(3)
+
+  capacityAccount CapacityAccount @relation(fields: [capacityAccountId], references: [id])
+
+  @@index([capacityAccountId, observedAt])
+}
+
+/// Capacity a user commits to the exchange.
+/// remaining = committedTokens - reservedTokens - consumedTokens (derived, not
+/// stored, so it cannot drift). CHECK: reserved + consumed <= committed.
+model CapacityContribution {
+  id                BigInt         @id @default(autoincrement())
+  publicId          String         @unique @db.VarChar(40)
+  capacityAccountId BigInt
+  committedTokens   BigInt
+  reservedTokens    BigInt         @default(0)
+  consumedTokens    BigInt         @default(0)
+  status            CapacityStatus @default(PENDING)
+  expiresAt         DateTime?      @db.Timestamptz(3)
+  createdAt         DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime       @updatedAt @db.Timestamptz(3)
+
+  capacityAccount CapacityAccount       @relation(fields: [capacityAccountId], references: [id])
+  reservations    CapacityReservation[]
+  offers          ExchangeOffer[]
+
+  @@index([capacityAccountId])
+  @@index([status, expiresAt])
+}
+
+model CapacityReservation {
+  id             BigInt                    @id @default(autoincrement())
+  publicId       String                    @unique @db.VarChar(40)
+  contributionId BigInt
+  agreementId    BigInt?
+  tokens         BigInt
+  status         CapacityReservationStatus @default(HELD)
+  idempotencyKey String
+  expiresAt      DateTime?                 @db.Timestamptz(3)
+  releasedAt     DateTime?                 @db.Timestamptz(3)
+  createdAt      DateTime                  @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime                  @updatedAt @db.Timestamptz(3)
+
+  contribution CapacityContribution @relation(fields: [contributionId], references: [id])
+  agreement    ExchangeAgreement?   @relation(fields: [agreementId], references: [id], onDelete: Restrict)
+  entitlements Entitlement[]
+
+  @@unique([contributionId, idempotencyKey])
+  @@index([agreementId])
+  @@index([status, expiresAt])
+}
+
+// ═════════════════════ EC WALLET LEDGER ═════════════════════
+// Internal platform accounting unit. Balance mutations MUST happen inside a DB
+// transaction holding a row lock on Wallet; WalletTransaction rows are
+// immutable (DB triggers reject UPDATE/DELETE/TRUNCATE).
+
+model Wallet {
+  id        BigInt   @id @default(autoincrement())
+  publicId  String   @unique @db.VarChar(40)
+  userId    BigInt   @unique
+  /// Cached balance. CHECK >= 0. Source of truth is the transaction history.
+  balance   Decimal  @default(0) @db.Decimal(20, 6)
+  /// Optimistic-concurrency counter, incremented on every balance change.
+  version   Int      @default(0)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  user         User                @relation(fields: [userId], references: [id])
+  transactions WalletTransaction[]
+}
+
+model WalletTransaction {
+  id             BigInt                @id @default(autoincrement())
+  publicId       String                @unique @db.VarChar(40)
+  walletId       BigInt
+  type           WalletTransactionType
+  direction      LedgerDirection
+  amount         Decimal               @db.Decimal(20, 6)
+  balanceBefore  Decimal               @db.Decimal(20, 6)
+  balanceAfter   Decimal               @db.Decimal(20, 6)
+  referenceType  String?
+  referenceId    String?
+  /// Prevents double-spend / duplicate application of the same operation.
+  idempotencyKey String
+  metadata       Json?
+  createdAt      DateTime              @default(now()) @db.Timestamptz(3)
+
+  wallet Wallet @relation(fields: [walletId], references: [id])
+
+  @@unique([walletId, idempotencyKey])
+  @@index([walletId, createdAt])
+  @@index([referenceType, referenceId])
+}
+
+// ───────────────────────── Pricing ─────────────────────────
+// Data-driven and versioned. Milestone 1 ships NO price data.
+//
+// PricingRate preserves the PROVIDER'S actual price in USD per 1M tokens,
+// independently of the internal EC unit. The version (label, source, effective
+// dates) is authoritative for which rates apply and when. Future flow:
+//
+//   actual provider usage
+//     -> provider USD cost   (PricingRate.usdPerMillionTokens, per usage type)
+//     -> EC conversion       (separate concern; NOT stored on PricingRate)
+//     -> EC cost             (UsageRecord.ecCost)
+//
+// UsageRecord.providerCostUsd / ecCost / pricingVersionId record the result.
+
+model PricingVersion {
+  id            BigInt               @id @default(autoincrement())
+  publicId      String               @unique @db.VarChar(40)
+  label         String               @unique
+  status        PricingVersionStatus @default(DRAFT)
+  /// Where the numbers came from (document, URL, decision record).
+  source        String
+  effectiveFrom DateTime             @db.Timestamptz(3)
+  effectiveTo   DateTime?            @db.Timestamptz(3)
+  notes         String?
+  createdAt     DateTime             @default(now()) @db.Timestamptz(3)
+
+  rates              PricingRate[]
+  exchangeAgreements ExchangeAgreement[]
+  usageRecords       UsageRecord[]
+
+  @@index([status, effectiveFrom])
+}
+
+model PricingRate {
+  id                  BigInt    @id @default(autoincrement())
+  publicId            String    @unique @db.VarChar(40)
+  pricingVersionId    BigInt
+  providerModelId     BigInt
+  usageType           UsageType
+  /// Tier/mode discriminator (e.g. "standard", "batch", "long-context").
+  tier                String    @default("standard")
+  /// Provider list price in USD per 1,000,000 tokens for this exact
+  /// model + usage type + tier. Decimal(20,8): exact, no floating point.
+  /// Never EC. Values must come from a sourced PricingVersion.
+  usdPerMillionTokens Decimal   @db.Decimal(20, 8)
+  createdAt           DateTime  @default(now()) @db.Timestamptz(3)
+
+  pricingVersion PricingVersion @relation(fields: [pricingVersionId], references: [id])
+  providerModel  ProviderModel  @relation(fields: [providerModelId], references: [id])
+
+  @@unique([pricingVersionId, providerModelId, usageType, tier])
+  @@index([providerModelId])
+}
+
+// ───────────────────────── Exchange ─────────────────────────
+
+model ExchangeOffer {
+  id                    BigInt              @id @default(autoincrement())
+  publicId              String              @unique @db.VarChar(40)
+  makerId               BigInt
+  offeredContributionId BigInt?
+  offeredModelId        BigInt
+  offeredTokens         BigInt
+  requestedModelId      BigInt?
+  requestedTokens       BigInt?
+  quotedEc              Decimal?            @db.Decimal(20, 6)
+  status                ExchangeOfferStatus @default(OPEN)
+  expiresAt             DateTime?           @db.Timestamptz(3)
+  createdAt             DateTime            @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime            @updatedAt @db.Timestamptz(3)
+
+  maker               User                  @relation(fields: [makerId], references: [id])
+  offeredContribution CapacityContribution? @relation(fields: [offeredContributionId], references: [id], onDelete: Restrict)
+  offeredModel        ProviderModel         @relation("OfferOfferedModel", fields: [offeredModelId], references: [id])
+  requestedModel      ProviderModel?        @relation("OfferRequestedModel", fields: [requestedModelId], references: [id], onDelete: Restrict)
+  agreements          ExchangeAgreement[]
+
+  @@index([status, expiresAt])
+  @@index([makerId, status])
+  @@index([offeredModelId])
+  @@index([requestedModelId])
+  @@index([offeredContributionId])
+}
+
+model ExchangeAgreement {
+  id               BigInt                  @id @default(autoincrement())
+  publicId         String                  @unique @db.VarChar(40)
+  offerId          BigInt
+  offerorId        BigInt
+  counterpartyId   BigInt
+  pricingVersionId BigInt?
+  status           ExchangeAgreementStatus @default(PROPOSED)
+  /// Immutable snapshot of agreed terms at proposal time.
+  termsSnapshot    Json
+  proposedAt       DateTime                @default(now()) @db.Timestamptz(3)
+  acceptedAt       DateTime?               @db.Timestamptz(3)
+  activatedAt      DateTime?               @db.Timestamptz(3)
+  settledAt        DateTime?               @db.Timestamptz(3)
+  cancelledAt      DateTime?               @db.Timestamptz(3)
+  expiresAt        DateTime?               @db.Timestamptz(3)
+  createdAt        DateTime                @default(now()) @db.Timestamptz(3)
+  updatedAt        DateTime                @updatedAt @db.Timestamptz(3)
+
+  offer          ExchangeOffer         @relation(fields: [offerId], references: [id])
+  offeror        User                  @relation("AgreementOfferor", fields: [offerorId], references: [id])
+  counterparty   User                  @relation("AgreementCounterparty", fields: [counterpartyId], references: [id])
+  pricingVersion PricingVersion?       @relation(fields: [pricingVersionId], references: [id], onDelete: Restrict)
+  reservations   CapacityReservation[]
+  entitlements   Entitlement[]
+
+  @@index([offerId])
+  @@index([offerorId, status])
+  @@index([counterpartyId, status])
+  @@index([pricingVersionId])
+  @@index([status, expiresAt])
+}
+
+/// Right to consume capacity of one provider model, issued from an agreement.
+/// remaining = committedTokens - reservedTokens - consumedTokens (derived).
+model Entitlement {
+  id                  BigInt            @id @default(autoincrement())
+  publicId            String            @unique @db.VarChar(40)
+  ownerId             BigInt
+  agreementId         BigInt
+  providerModelId     BigInt
+  sourceReservationId BigInt?
+  committedTokens     BigInt
+  reservedTokens      BigInt            @default(0)
+  consumedTokens      BigInt            @default(0)
+  status              EntitlementStatus @default(ACTIVE)
+  expiresAt           DateTime?         @db.Timestamptz(3)
+  createdAt           DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime          @updatedAt @db.Timestamptz(3)
+
+  owner             User                 @relation(fields: [ownerId], references: [id])
+  agreement         ExchangeAgreement    @relation(fields: [agreementId], references: [id])
+  providerModel     ProviderModel        @relation(fields: [providerModelId], references: [id])
+  sourceReservation CapacityReservation? @relation(fields: [sourceReservationId], references: [id], onDelete: Restrict)
+  usageRecords      UsageRecord[]
+
+  @@index([ownerId, status])
+  @@index([agreementId])
+  @@index([providerModelId])
+  @@index([sourceReservationId])
+  @@index([status, expiresAt])
+}
+
+// ───────────────────────── Usage ─────────────────────────
+
+/// One metered provider request. Input / cached input / output are kept apart
+/// so each can be priced separately. Provider + model identity (via
+/// providerModelId) always stays attached. No rows are ever fabricated.
+model UsageRecord {
+  id                BigInt            @id @default(autoincrement())
+  publicId          String            @unique @db.VarChar(40)
+  userId            BigInt
+  projectId         BigInt?
+  entitlementId     BigInt?
+  providerModelId   BigInt
+  pricingVersionId  BigInt?
+  requestId         String            @unique
+  inputTokens       BigInt            @default(0)
+  cachedInputTokens BigInt            @default(0)
+  outputTokens      BigInt            @default(0)
+  totalTokens       BigInt            @default(0)
+  /// Provider cost in USD, computed from PricingRate.usdPerMillionTokens.
+  providerCostUsd   Decimal?          @db.Decimal(20, 8)
+  /// Internal EC cost, derived from providerCostUsd by the EC conversion step.
+  ecCost            Decimal?          @db.Decimal(20, 6)
+  status            UsageRecordStatus @default(PENDING)
+  createdAt         DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime          @updatedAt @db.Timestamptz(3)
+
+  user           User            @relation(fields: [userId], references: [id])
+  project        Project?        @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  entitlement    Entitlement?    @relation(fields: [entitlementId], references: [id], onDelete: Restrict)
+  providerModel  ProviderModel   @relation(fields: [providerModelId], references: [id])
+  pricingVersion PricingVersion? @relation(fields: [pricingVersionId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@index([projectId])
+  @@index([entitlementId])
+  @@index([providerModelId])
+  @@index([pricingVersionId])
+  @@index([status])
+}
+
+// ───────────────────────── Audit ─────────────────────────
+
+/// Append-only. DB triggers reject UPDATE/DELETE/TRUNCATE; the repository
+/// exposes no update/delete. Hash-chaining is intentionally deferred.
+model AuditEvent {
+  id         BigInt         @id @default(autoincrement())
+  publicId   String         @unique @db.VarChar(40)
+  actorId    BigInt?
+  eventType  AuditEventType
+  entityType String
+  entityId   String
+  metadata   Json?
+  requestId  String?
+  createdAt  DateTime       @default(now()) @db.Timestamptz(3)
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@index([eventType, createdAt])
+  @@index([requestId])
+}
+
+// ───────────────────── Platform foundations ─────────────────────
+
+model Project {
+  id          BigInt        @id @default(autoincrement())
+  publicId    String        @unique @db.VarChar(40)
+  ownerId     BigInt
+  name        String
+  description String?
+  status      ProjectStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime      @updatedAt @db.Timestamptz(3)
+
+  owner        User          @relation(fields: [ownerId], references: [id])
+  usageRecords UsageRecord[]
+
+  @@index([ownerId, status])
+}
+
+model Notification {
+  id        BigInt           @id @default(autoincrement())
+  publicId  String           @unique @db.VarChar(40)
+  userId    BigInt
+  type      NotificationType
+  title     String
+  message   String
+  /// null = unread
+  readAt    DateTime?        @db.Timestamptz(3)
+  createdAt DateTime         @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, readAt, createdAt])
+}
+
+/// Developer API keys. The raw secret is shown once at creation and NEVER
+/// stored — only `secretHash`. `publicId` doubles as the public key identifier.
+model DeveloperApiKey {
+  id            BigInt    @id @default(autoincrement())
+  publicId      String    @unique @db.VarChar(40)
+  userId        BigInt
+  name          String
+  secretHash    String
+  hashAlgorithm String
+  scopes        String[]
+  expiresAt     DateTime? @db.Timestamptz(3)
+  revokedAt     DateTime? @db.Timestamptz(3)
+  lastUsedAt    DateTime? @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
